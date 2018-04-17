@@ -8,22 +8,32 @@
 
 #define ADDRESS 0x04
 #define DEVICE "/dev/i2c-1"
+#define LOCK_FILE "/var/lock/ardui2c.lock"
 
 
 int main(int argc, char** argv) {
+   if (access(LOCK_FILE, F_OK)) {
+      usleep(500000);
+   }
+   int out = 0;
+   int lock = open(LOCK_FILE, O_CREAT, O_WRONLY);
+   float val;
    if (argc != 2) {
       printf("Missing parameter. Aborting");
-      exit(1);
+      out = 1;
+      goto end;
    }
    int file;
    if ((file = open(DEVICE, O_RDWR)) < 0) {
 
       printf("Fatal: unable to device (do you have privileges?)\n");
-      exit(1);
+      out = 1;
+      goto end;
    }
    if (ioctl(file, I2C_SLAVE, ADDRESS) < 0) {
       printf("Fatal: unable to access i2c device  0x%x\n", ADDRESS);
-      exit(1);
+      out = 1;
+      goto end;
    }
 
    int r1,r2,i;
@@ -37,9 +47,18 @@ int main(int argc, char** argv) {
          break;
       }
    }
-   printf("%s\t(%d,%d)\n",buf,r1,r2);
-   usleep(10000);
+   if (i>6) {
+      printf("%s\n",buf);
+   } else {
+      val=atof(buf);
+      printf("%f\n",val);
+   }
+
+end:
    close(file);
-   return (EXIT_SUCCESS);
+   close(lock);
+   unlink(LOCK_FILE);
+   usleep(10000);
+   return out;
 }
 
