@@ -2,56 +2,199 @@
 # -*- coding: utf-8 -*-
 
 ARDUI2C="/home/pi/ardui2c"
-BROADCAST_PORT=50000
+HEARTBEAT_DAEMON="/home/pi/rpi_heartbeat.py"
+BROADCAST_DAEMON="/home/pi/rpi_broadcast.py"
 DELAY=5
+LOCK_FILE="/tmp/rpi.lock"
+LOCK_TIMEOUT=100
+MIN_VOLTAGE=9.5
+MIN_DISKSPACE=104857600
+debug_mode=False
+test_mode=False
+WAIT_FOR_REMOTE=30
+
+
+ERRCODE_INVALID_OPMODE="Y1"
+ERRCODE_LOWBATT="Y11"
+ERRCODE_DISKFULL="Y21"
+ERRCODE_TEST_FAILED="Y101"
+ERRCODE_RUN_FAILED="Y102"
+ERRCODE_PROCESS_DIED="Y103"
+
 
 import time
 import os
 import sys
-from socket import *
-from subprocess import Popen as popen
-from subprocess import PIPE
+import syslog
+from subprocess import Popen, PIPE
+
+from threading  import Thread
+from Queue import Queue, Empty
+def enqueue_output(out, queue):
+    for line in iter(out.readline, b''):
+        queue.put(line)
+    out.close()
+
+
+
+
+
+def ardIO(cmd):
+   if cmd.startswith("Y"):
+      syslog.syslog(syslog.LOG_ERR, "Sending ARDIO %s" % cmd)
+   p = Popen([ARDUI2C,cmd], shell=False, stdin=None, stdout=PIPE, stderr=None, close_fds=True)
+   p.wait()
+   data = p.stdout.read()
+   try:
+       return float(data)
+   except:
+       syslog.syslog(syslog.LOG_ERR, "Erroring reading ardIO value: %s" % data)
+   return 0
+
+
+
+def common_tests():
+   voltage = ardIO("v")
+   if (voltage < MIN_VOLTAGE):
+      syslog.syslog(syslog.LOG_ERR, "Voltage under limit")
+      ardIO(ERRCODE_LOWBATT)
+      return False
+   st = os.statvfs("/")
+   disk_free = st.f_bavail * st.f_frsize
+   if (disk_free < MIN_DISKSPACE):
+      syslog.syslog(syslog.LOG_ERR, "No enougth disk space")
+      ardIO(ERRCODE_DISKFULL)
+      return False
+   return True
+
+def quit(val):
+   if not debug_mode:
+      ardIO("Q")
+      p = Popen(["sudo","halt"], stdin=None, stdout=None, stderr=None)
+      if(val)==0:
+	ardIO("Y")
+   sys.exit(val)
+
+
+
+
+#------------------------------x
+# Run sub_daemons
+#------------------------------
+
+syslog.syslog("Starting up")
+
+heartbeat = Popen(["nohup","python",HEARTBEAT_DAEMON], stdin=None, stdout=None, stderr=None, preexec_fn=os.setpgrp)
+syslog.syslog("Launched heartbeat")
+
+
+broadcast = Popen(["nohup","python",BROADCAST_DAEMON], stdin=PIPE, stdout=None, stderr=None, preexec_fn=os.setpgrp)
+syslog.syslog("Launched broadcast deaemon")
+
+
+
+
+
+
+#------------------------------
+# Global vars
+#------------------------------
+
+operations = {
+   0: {"test":"/home/pi/run.manual.py","run":"/home/pi/run.manual.py"},
+   1: {"test":"/home/pi/test.camera.py","run":"/home/pi/run.camera.py"},
+}
+
+
+
 
 
 #------------------------------
 # Getting running mode
 #------------------------------
-debug=False
-cmd = ARDUI2C+" m"
-p = popen(cmd, shell=True, stdin=None, stdout=PIPE, stderr=None, close_fds=True)
-runstatus = p.stdout.read()
-runstatus = int(runstatus[0:runstatus.find(".")])
-print runstatus
-opmode=runstatus&0x7f
-if(runstatus&0x80>0): debug=True
+runstatus = int(ardIO("m"))
+opmode=runstatus&0x3f
 
-print opmode, debug
+if(runstatus&0x80>0):
+   debug_mode=True
+if(runstatus&0x40>0):
+   test_mode=True
 
+syslog.syslog("Running in mode: %d, Debug mode: %d, First Start: %d" % (opmode, debug_mode, test_mode))
 
+# Check if operation is in the oplist
+if not opmode in operations:
+   # halt returnig error otherwise
+   syslog.syslog("Unable to fine operation code %d" % opmode)
+   ardIO(ERRCODE_INVALID_OPMODE)
+   quit(1)
 
+if not common_tests():
+   quit(1)
 
-
-def rpi_broadcast_message():
-   return "hello world!"
-
-
-
-
-if debug:
-   # do some test
-
-   # switch opmode
-
+if test_mode:
+   main_process=Popen(["python",operations[opmode]["test"]], stdin=None, stdout=PIPE, stderr=None)
 else:
-   # switch opmode
+   main_process=Popen(["python",operations[opmode]["run"]], stdin=None, stdout=PIPE, stderr=None)
+
+q = Queue()
+t = Thread(target=enqueue_output, args=(main_process.stdout, q))
+t.daemon = True
+t.start()
+
+#------------------------------
+# mainloop
+#------------------------------
+
+while True:
+   try:  line = q.get_nowait()
+   except Empty:
+      # while waiting output from program
+      batt = ardIO("v")
+      if (batt<MIN_VOLTAGE):
+         ardIO(ERRCODE_LOWBATT)
+         syslog.syslog("Low battery %s" % batt)
+         quit(1)
+         break
+      if main_process.poll()!=None:
+         ardIO(ERRCODE_PROCESS_DIED)
+         syslog.syslog("Process died unexpectedly. Opmode: %d" % opmode)
+         quit(1)
+         break
+   else:
+      if (line.lower().find("ok")>=0):
+         break
+      else:
+         if (test_mode):
+            ardIO(ERRCODE_TEST_FAILED)
+            syslog.syslog("Test failed. Opmode:%d" % opmode)
+         else:
+            ardIO(ERRCODE_RUN_FAILED)
+            syslog.syslog("Run failed. Opmode:%d" % opmode)
+         quit(1)
+         break
+   time.sleep(DELAY)
 
 
-   # start core enviroment
-   s = socket(AF_INET, SOCK_DGRAM)
-   s.bind(('', 0))
-   s.setsockopt(SOL_SOCKET, SO_BROADCAST, 1)
-   while True:
-      s.sendto("ciao\n\n", ('<broadcast>', BROADCAST_PORT))
-      os.popen(ARDUI2C+" H")
-      time.sleep(DELAY)
 
+if not test_mode:
+   time.sleep(WAIT_FOR_REMOTE)
+
+#------------------------------
+# Shutdown
+#------------------------------
+
+# Don't shutdown in case of lock (manual mode)
+while (os.path.isfile(LOCK_FILE)):
+   # Manual mode has a LOCK_TIMEOUT
+   last_lock_time = os.stat(LOCK_FILE).st_mtime
+   if (time.time()-last_lock_time>LOCK_TIMEOUT):
+      break
+   # Stop rpi in case of low voltage
+   #if (ardIO("v")<MIN_VOLTAGE):
+   #   ardIO(ERRCODE_LOWBATT)
+   #   syslog.syslog("Low battery %s" % opmode)
+   #   quit(1)
+   time.sleep(DELAY)
+
+quit(0)
